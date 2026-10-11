@@ -1,0 +1,2947 @@
+#!/usr/bin/env python3
+
+# -*- coding: utf-8 -*-
+
+"""
+
+NEXUS ADS ENGINE v3.4
+
+Full-stack ad server. Own protocol. Own logic. Own schema.
+
+Cache + WAL + pool threads + auth cache.
+
+Promotion automatique pour figure-humain.
+
+Pure Python. SQLite. HTTP on port 8000.
+
+"""
+
+
+
+import os
+
+import sys
+
+import json
+
+import time
+
+import uuid
+
+import shutil
+
+import sqlite3
+
+import hashlib
+
+import threading
+
+import http.server
+
+import socketserver
+
+from datetime import datetime, timedelta
+
+from pathlib import Path
+
+from urllib.parse import urlparse, parse_qs
+
+
+
+BASE = Path.cwd()
+
+DATA = BASE / "ads_engine_data"
+
+DATA.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = DATA / "ads.db"
+
+BACKUP_DIR = DATA / "backups"
+
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+LOG_DIR = BASE / "logs"
+
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+LOG_FILE = LOG_DIR / "ads_engine.log"
+
+AUDIT_FILE = DATA / "audit.log"
+
+LOCK_FILE = DATA / ".lock"
+
+
+
+PORT = int(os.environ.get("PORT", 8000))
+
+HOST = "0.0.0.0"
+
+ENGINE_VERSION = "3.4.0"
+
+
+
+PROJET_URL = "https://github.com/Aissamohammedi88/figure-humain"
+
+PROJET_NOM = "Figure-Humain"
+
+
+
+G = "\033[92m"
+
+Y = "\033[93m"
+
+R = "\033[91m"
+
+B = "\033[94m"
+
+C = "\033[96m"
+
+M = "\033[95m"
+
+N = "\033[0m"
+
+
+
+
+
+def log(level, msg):
+
+    line = "[" + datetime.now().isoformat() + "] [" + level + "] " + msg
+
+    try:
+
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+
+            f.write(line + "\n")
+
+    except Exception:
+
+        pass
+
+    color = {"OK": G, "WARN": Y, "ERR": R, "INFO": B, "AUDIT": M}.get(level, C)
+
+    print(color + "[" + level + "]" + N + " " + msg)
+
+
+
+
+
+def audit(action, payload):
+
+    entry = {"ts": datetime.now().isoformat(), "action": action, "payload": payload}
+
+    try:
+
+        with open(AUDIT_FILE, "a", encoding="utf-8") as f:
+
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    except Exception:
+
+        pass
+
+
+
+
+
+def check_lock():
+
+    if LOCK_FILE.exists():
+
+        try:
+
+            age = time.time() - LOCK_FILE.stat().st_mtime
+
+            if age < 60:
+
+                try:
+
+                    pid = int(LOCK_FILE.read_text().strip())
+
+                    os.kill(pid, 0)
+
+                    log("WARN", "Autre instance detectee (PID " + str(pid) + ")")
+
+                    return False
+
+                except (ValueError, ProcessLookupError):
+
+                    pass
+
+        except Exception:
+
+            pass
+
+    LOCK_FILE.write_text(str(os.getpid()))
+
+    return True
+
+
+
+
+
+SCHEMA = """
+
+CREATE TABLE IF NOT EXISTS accounts (
+
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, currency TEXT DEFAULT 'USD',
+
+    timezone TEXT DEFAULT 'UTC', status TEXT DEFAULT 'ACTIVE',
+
+    balance_micros INTEGER DEFAULT 0, created_at TEXT NOT NULL
+
+);
+
+
+
+CREATE TABLE IF NOT EXISTS users (
+
+    id TEXT PRIMARY KEY, account_id TEXT NOT NULL, email TEXT NOT NULL,
+
+    role TEXT DEFAULT 'VIEWER', api_key TEXT NOT NULL UNIQUE,
+
+    last_login TEXT, created_at TEXT NOT NULL
+
+);
+
+
+
+CREATE TABLE IF NOT EXISTS campaigns (
+
+    id TEXT PRIMARY KEY, account_id TEXT NOT NULL, name TEXT NOT NULL,
+
+    status TEXT DEFAULT 'PAUSED', budget_micros INTEGER DEFAULT 0,
+
+    budget_type TEXT DEFAULT 'DAILY', bid_strategy TEXT DEFAULT 'MANUAL_CPC',
+
+    target_cpa_micros INTEGER DEFAULT 0, target_roas REAL DEFAULT 0.0,
+
+    start_date TEXT, end_date TEXT, network_search INTEGER DEFAULT 1,
+
+    network_display INTEGER DEFAULT 0, created_at TEXT NOT NULL
+
+);
+
+
+
+CREATE TABLE IF NOT EXISTS ad_groups (
+
+    id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, name TEXT NOT NULL,
+
+    cpc_bid_micros INTEGER DEFAULT 0, status TEXT DEFAULT 'PAUSED',
+
+    created_at TEXT NOT NULL
+
+);
+
+
+
+CREATE TABLE IF NOT EXISTS ads (
+
+    id TEXT PRIMARY KEY, ad_group_id TEXT NOT NULL,
+
+    type TEXT DEFAULT 'RESPONSIVE_SEARCH',
+
+    headline1 TEXT NOT NULL, headline2 TEXT, headline3 TEXT,
+
+    description1 TEXT, description2 TEXT,
+
+    final_url TEXT NOT NULL, display_url TEXT,
+
+    status TEXT DEFAULT 'PAUSED', created_at TEXT NOT NULL
+
+);
+
+
+
+CREATE TABLE IF NOT EXISTS keywords (
+
+    id TEXT PRIMARY KEY, ad_group_id TEXT NOT NULL, text TEXT NOT NULL,
+
+    match_type TEXT DEFAULT 'BROAD', status TEXT DEFAULT 'ACTIVE',
+
+    quality_score INTEGER DEFAULT 5, cpc_bid_micros INTEGER DEFAULT 0,
+
+    created_at TEXT NOT NULL
+
+);
+
+
+
+CREATE TABLE IF NOT EXISTS negative_keywords (
+
+    id TEXT PRIMARY KEY, campaign_id TEXT, ad_group_id TEXT,
+
+    text TEXT NOT NULL, match_type TEXT DEFAULT 'BROAD',
+
+    created_at TEXT NOT NULL
+
+);
+
+
+
+CREATE TABLE IF NOT EXISTS audiences (
+
+    id TEXT PRIMARY KEY, account_id TEXT NOT NULL, name TEXT NOT NULL,
+
+    type TEXT DEFAULT 'CUSTOM', size INTEGER DEFAULT 0,
+
+    created_at TEXT NOT NULL
+
+);
+
+
+
+CREATE TABLE IF NOT EXISTS audience_members (
+
+    id INTEGER PRIMARY KEY AUTOINCREMENT, audience_id TEXT NOT NULL,
+
+    user_hash TEXT NOT NULL, added_at TEXT NOT NULL,
+
+    UNIQUE(audience_id, user_hash)
+
+);
+
+
+
+CREATE TABLE IF NOT EXISTS targeting (
+
+    id TEXT PRIMARY KEY, ad_group_id TEXT NOT NULL,
+
+    kind TEXT NOT NULL, value TEXT NOT NULL,
+
+    bid_modifier REAL DEFAULT 1.0, created_at TEXT NOT NULL
+
+);
+
+
+
+CREATE TABLE IF NOT EXISTS metrics (
+
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
+
+    date TEXT NOT NULL, hour INTEGER DEFAULT -1,
+
+    impressions INTEGER DEFAULT 0, clicks INTEGER DEFAULT 0,
+
+    cost_micros INTEGER DEFAULT 0, conversions INTEGER DEFAULT 0,
+
+    revenue_micros INTEGER DEFAULT 0,
+
+    UNIQUE(entity_type, entity_id, date, hour)
+
+);
+
+
+
+CREATE TABLE IF NOT EXISTS auctions (
+
+    id TEXT PRIMARY KEY, query TEXT NOT NULL,
+
+    request_json TEXT NOT NULL, response_json TEXT NOT NULL,
+
+    winner_ad_id TEXT, winner_bid_micros INTEGER DEFAULT 0,
+
+    created_at TEXT NOT NULL
+
+);
+
+
+
+CREATE TABLE IF NOT EXISTS clicks (
+
+    id TEXT PRIMARY KEY, ad_id TEXT NOT NULL, keyword_id TEXT,
+
+    ip_hash TEXT, user_agent TEXT, gclid TEXT, ts TEXT NOT NULL
+
+);
+
+
+
+CREATE TABLE IF NOT EXISTS conversions (
+
+    id TEXT PRIMARY KEY, click_id TEXT, ad_id TEXT,
+
+    value_micros INTEGER DEFAULT 0, ts TEXT NOT NULL
+
+);
+
+
+
+CREATE TABLE IF NOT EXISTS audit (
+
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+
+    action TEXT NOT NULL, payload TEXT
+
+);
+
+
+
+CREATE TABLE IF NOT EXISTS rate_limits (
+
+    id TEXT PRIMARY KEY, bucket TEXT NOT NULL,
+
+    window_start INTEGER NOT NULL, count INTEGER DEFAULT 0
+
+);
+
+
+
+CREATE INDEX IF NOT EXISTS idx_camp_acc ON campaigns(account_id);
+
+CREATE INDEX IF NOT EXISTS idx_ag_camp ON ad_groups(campaign_id);
+
+CREATE INDEX IF NOT EXISTS idx_ads_ag ON ads(ad_group_id);
+
+CREATE INDEX IF NOT EXISTS idx_kw_ag ON keywords(ad_group_id);
+
+CREATE INDEX IF NOT EXISTS idx_users_key ON users(api_key);
+
+CREATE INDEX IF NOT EXISTS idx_metric_entity ON metrics(entity_type, entity_id, date);
+
+"""
+
+
+
+
+
+def db():
+
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+
+    conn.row_factory = sqlite3.Row
+
+    conn.execute("PRAGMA busy_timeout = 30000")
+
+    conn.execute("PRAGMA journal_mode = WAL")
+
+    conn.execute("PRAGMA synchronous = NORMAL")
+
+    conn.execute("PRAGMA cache_size = -64000")
+
+    conn.execute("PRAGMA temp_store = MEMORY")
+
+    return conn
+
+
+
+
+
+def init_db():
+
+    conn = db()
+
+    conn.executescript(SCHEMA)
+
+    conn.commit()
+
+    conn.close()
+
+    log("OK", "DB initialized: " + str(DB_PATH))
+
+
+
+
+
+def backup_db():
+
+    if DB_PATH.exists():
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        target = BACKUP_DIR / ("ads_" + ts + ".db")
+
+        try:
+
+            shutil.copy2(DB_PATH, target)
+
+            log("OK", "Backup : " + target.name)
+
+            backups = sorted(BACKUP_DIR.glob("ads_*.db"))
+
+            for old in backups[:-5]:
+
+                old.unlink()
+
+        except Exception as e:
+
+            log("WARN", "Backup echoue : " + str(e))
+
+
+
+
+
+def nid(prefix):
+
+    return prefix + "_" + uuid.uuid4().hex[:16]
+
+
+
+
+
+STATUS_CACHE = {"data": None, "ts": 0}
+
+STATUS_CACHE_LOCK = threading.Lock()
+
+STATUS_CACHE_TTL = 2
+
+
+
+AUTH_CACHE = {}
+
+AUTH_CACHE_LOCK = threading.Lock()
+
+AUTH_CACHE_TTL = 5
+
+
+
+
+
+class Validator:
+
+    @staticmethod
+
+    def require_str(obj, key, min_len=1, max_len=500):
+
+        v = obj.get(key)
+
+        if not isinstance(v, str) or len(v) < min_len or len(v) > max_len:
+
+            raise ValueError("Champ '" + key + "' : string requis")
+
+        return v.strip()
+
+
+
+    @staticmethod
+
+    def require_int(obj, key, min_val=0, max_val=10**12):
+
+        v = obj.get(key, 0)
+
+        try:
+
+            v = int(v)
+
+        except Exception:
+
+            raise ValueError("Champ '" + key + "' : entier requis")
+
+        if v < min_val or v > max_val:
+
+            raise ValueError("Champ '" + key + "' hors limites")
+
+        return v
+
+
+
+    @staticmethod
+
+    def optional_str(obj, key, default="", max_len=500):
+
+        v = obj.get(key, default)
+
+        if v is None:
+
+            v = default
+
+        if not isinstance(v, str):
+
+            v = str(v)
+
+        return v[:max_len]
+
+
+
+    @staticmethod
+
+    def optional_float(obj, key, default=0.0):
+
+        v = obj.get(key, default)
+
+        try:
+
+            return float(v)
+
+        except Exception:
+
+            return default
+
+
+
+
+
+class Auth:
+
+    def __init__(self):
+
+        self.public_routes = ["/", "/index.html", "/health",
+
+                              "/api/status", "/api/login"]
+
+
+
+    def check(self, headers, path):
+
+        if path in self.public_routes:
+
+            return True, "public"
+
+        auth_header = headers.get("Authorization", "")
+
+        if not auth_header.startswith("Bearer "):
+
+            return False, "missing_token"
+
+        token = auth_header[7:].strip()
+
+
+
+        now = time.time()
+
+        with AUTH_CACHE_LOCK:
+
+            cached = AUTH_CACHE.get(token)
+
+            if cached and (now - cached["ts"]) < AUTH_CACHE_TTL:
+
+                return True, cached["user"]
+
+
+
+        conn = db()
+
+        cur = conn.cursor()
+
+        cur.execute("SELECT id, role FROM users WHERE api_key=?", (token,))
+
+        row = cur.fetchone()
+
+        conn.close()
+
+        if not row:
+
+            return False, "invalid_token"
+
+        user = dict(row)
+
+
+
+        with AUTH_CACHE_LOCK:
+
+            AUTH_CACHE[token] = {"user": user, "ts": now}
+
+        return True, user
+
+
+
+
+
+AUTH = Auth()
+
+
+
+
+
+ALLOWED_TABLES = {
+
+    "accounts": ["id", "name", "currency", "timezone", "status", "balance_micros", "created_at"],
+
+    "users": ["id", "account_id", "email", "role", "api_key", "last_login", "created_at"],
+
+    "campaigns": ["id", "account_id", "name", "status", "budget_micros", "budget_type",
+
+                  "bid_strategy", "target_cpa_micros", "target_roas", "start_date",
+
+                  "end_date", "network_search", "network_display", "created_at"],
+
+    "ad_groups": ["id", "campaign_id", "name", "cpc_bid_micros", "status", "created_at"],
+
+    "ads": ["id", "ad_group_id", "type", "headline1", "headline2", "headline3",
+
+            "description1", "description2", "final_url", "display_url", "status", "created_at"],
+
+    "keywords": ["id", "ad_group_id", "text", "match_type", "status", "quality_score",
+
+                 "cpc_bid_micros", "created_at"],
+
+    "negative_keywords": ["id", "campaign_id", "ad_group_id", "text", "match_type", "created_at"],
+
+    "audiences": ["id", "account_id", "name", "type", "size", "created_at"],
+
+    "audience_members": ["id", "audience_id", "user_hash", "added_at"],
+
+    "targeting": ["id", "ad_group_id", "kind", "value", "bid_modifier", "created_at"],
+
+    "metrics": ["id", "entity_type", "entity_id", "date", "hour", "impressions",
+
+                "clicks", "cost_micros", "conversions", "revenue_micros"],
+
+    "auctions": ["id", "query", "winner_ad_id", "winner_bid_micros", "created_at"],
+
+    "clicks": ["id", "ad_id", "keyword_id", "ip_hash", "user_agent", "gclid", "ts"],
+
+    "conversions": ["id", "click_id", "ad_id", "value_micros", "ts"],
+
+    "audit": ["id", "ts", "action", "payload"],
+
+    "rate_limits": ["id", "bucket", "window_start", "count"],
+
+}
+
+
+
+
+
+class Query:
+
+    def __init__(self, raw):
+
+        self.raw = raw.strip()
+
+        self.select = []
+
+        self.frm = None
+
+        self.where = []
+
+        self.order = None
+
+        self.limit = None
+
+        self._parse()
+
+
+
+    def _parse(self):
+
+        s = self.raw
+
+        up = s.upper()
+
+        if " FROM " not in up:
+
+            raise ValueError("Missing FROM clause")
+
+        i = up.index(" FROM ")
+
+        select_part = s[:i].strip()
+
+        rest = s[i + 6:].strip()
+
+        if not select_part.upper().startswith("SELECT"):
+
+            raise ValueError("Must start with SELECT")
+
+        fields = select_part[6:].strip()
+
+        self.select = ["*"] if fields == "*" else [f.strip() for f in fields.split(",")]
+
+        kws = [" WHERE ", " ORDER BY ", " LIMIT ", " GROUP BY "]
+
+        pos = {}
+
+        for kw in kws:
+
+            idx = rest.upper().find(kw)
+
+            if idx != -1:
+
+                pos[kw] = idx
+
+        if not pos:
+
+            self.frm = rest.strip()
+
+        else:
+
+            first = min(pos.values())
+
+            self.frm = rest[:first].strip()
+
+            if " WHERE " in pos:
+
+                start = pos[" WHERE "] + 7
+
+                ends = [p for k, p in pos.items() if k != " WHERE " and p > pos[" WHERE "]]
+
+                end = min(ends) if ends else len(rest)
+
+                self.where = self._parse_where(rest[start:end].strip())
+
+            if " ORDER BY " in pos:
+
+                start = pos[" ORDER BY "] + 10
+
+                ends = [p for k, p in pos.items() if k != " ORDER BY " and p > pos[" ORDER BY "]]
+
+                end = min(ends) if ends else len(rest)
+
+                self.order = rest[start:end].strip()
+
+            if " LIMIT " in pos:
+
+                start = pos[" LIMIT "] + 7
+
+                try:
+
+                    self.limit = int(rest[start:].strip().split()[0])
+
+                except Exception:
+
+                    self.limit = None
+
+        if self.frm not in ALLOWED_TABLES:
+
+            raise ValueError("Unknown table: " + self.frm)
+
+        for f in self.select:
+
+            if f != "*" and f not in ALLOWED_TABLES[self.frm]:
+
+                raise ValueError("Unknown field: " + f)
+
+
+
+    def _parse_where(self, clause):
+
+        conds = []
+
+        for part in clause.split(" AND "):
+
+            for op in [">=", "<=", "!=", "=", ">", "<"]:
+
+                if op in part:
+
+                    field, value = part.split(op, 1)
+
+                    field = field.strip()
+
+                    value = value.strip().strip("'\"")
+
+                    if field not in ALLOWED_TABLES[self.frm]:
+
+                        raise ValueError("Unknown field: " + field)
+
+                    conds.append((field, op, value))
+
+                    break
+
+        return conds
+
+
+
+    def execute(self):
+
+        conn = db()
+
+        cur = conn.cursor()
+
+        sql = "SELECT "
+
+        sql += "*" if self.select == ["*"] else ", ".join(self.select)
+
+        sql += " FROM " + self.frm
+
+        params = []
+
+        if self.where:
+
+            clauses = []
+
+            for f, op, v in self.where:
+
+                clauses.append(f + " " + op + " ?")
+
+                params.append(v)
+
+            sql += " WHERE " + " AND ".join(clauses)
+
+        if self.order:
+
+            sql += " ORDER BY " + self.order
+
+        if self.limit:
+
+            sql += " LIMIT ?"
+
+            params.append(self.limit)
+
+        try:
+
+            cur.execute(sql, params)
+
+            rows = [dict(r) for r in cur.fetchall()]
+
+        except Exception as e:
+
+            conn.close()
+
+            raise ValueError("SQL error: " + str(e))
+
+        conn.close()
+
+        return rows
+
+
+
+
+
+class BiddingEngine:
+
+    def compute_bid(self, base_bid_micros, signals):
+
+        bid = float(base_bid_micros)
+
+        qs = signals.get("quality_score", 5)
+
+        bid *= (0.5 + qs / 10.0)
+
+        ctr = signals.get("ctr", 0.0)
+
+        if ctr > 0.05:
+
+            bid *= 1.25
+
+        elif ctr > 0.02:
+
+            bid *= 1.1
+
+        elif ctr < 0.01:
+
+            bid *= 0.8
+
+        mt = signals.get("match_type", "BROAD")
+
+        if mt == "EXACT":
+
+            bid *= 1.3
+
+        elif mt == "PHRASE":
+
+            bid *= 1.1
+
+        h = datetime.now().hour
+
+        if 9 <= h <= 17:
+
+            bid *= 1.1
+
+        elif 0 <= h <= 5:
+
+            bid *= 0.7
+
+        if datetime.now().weekday() >= 5:
+
+            bid *= 0.9
+
+        device = signals.get("device", "MOBILE")
+
+        if device == "DESKTOP":
+
+            bid *= 1.15
+
+        elif device == "TABLET":
+
+            bid *= 0.95
+
+        if signals.get("in_audience"):
+
+            bid *= 1.2
+
+        convs = signals.get("past_conversions", 0)
+
+        if convs >= 10:
+
+            bid *= 1.3
+
+        elif convs >= 3:
+
+            bid *= 1.1
+
+        return int(bid)
+
+
+
+    def explain(self, base_bid_micros, signals):
+
+        parts = ["base=" + str(base_bid_micros),
+
+                 "qs=" + str(signals.get("quality_score", 5)),
+
+                 "ctr=" + str(round(signals.get("ctr", 0.0), 4)),
+
+                 "match=" + str(signals.get("match_type", "BROAD")),
+
+                 "device=" + str(signals.get("device", "MOBILE"))]
+
+        final = self.compute_bid(base_bid_micros, signals)
+
+        parts.append("final=" + str(final))
+
+        return " | ".join(parts)
+
+
+
+    def smart_bid(self, campaign, historical_cpa_micros, target_cpa_micros):
+
+        if target_cpa_micros <= 0:
+
+            return campaign.get("budget_micros", 0)
+
+        ratio = float(target_cpa_micros) / max(1.0, float(historical_cpa_micros))
+
+        return max(0, int(campaign.get("budget_micros", 0) * ratio))
+
+
+
+
+
+class Auction:
+
+    def run(self, candidates):
+
+        scored = []
+
+        for c in candidates:
+
+            bid = int(c.get("bid_micros", 0))
+
+            qs = float(c.get("quality_score", 5))
+
+            ctr = float(c.get("expected_ctr", 0.01))
+
+            audience = 1.2 if c.get("in_audience") else 1.0
+
+            quality_factor = 0.5 + qs / 10.0
+
+            ctr_factor = 1.0 + (ctr * 10.0)
+
+            score = int(bid * quality_factor * ctr_factor * audience)
+
+            scored.append({"ad_id": c["ad_id"], "score": score, "bid_micros": bid,
+
+                           "quality_score": qs, "expected_ctr": ctr,
+
+                           "in_audience": bool(c.get("in_audience"))})
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+
+        for i, s in enumerate(scored):
+
+            s["rank"] = i + 1
+
+        if len(scored) >= 2:
+
+            w = scored[0]
+
+            s = scored[1]
+
+            paid = int(s["score"] / (0.5 + w["quality_score"] / 10.0) / (1.0 + w["expected_ctr"] * 10.0))
+
+            w["paid_micros"] = max(1, paid)
+
+        elif scored:
+
+            scored[0]["paid_micros"] = 1
+
+        return scored
+
+
+
+
+
+class FraudDetector:
+
+    def __init__(self):
+
+        self._cache = {}
+
+        self._lock = threading.Lock()
+
+
+
+    def check(self, click):
+
+        score = 0.0
+
+        reasons = []
+
+        ip = click.get("ip_hash", "")
+
+        ua = click.get("user_agent", "")
+
+        key = "ip:" + ip
+
+        with self._lock:
+
+            self._cache[key] = self._cache.get(key, 0) + 1
+
+            count = self._cache[key]
+
+        if count > 10:
+
+            score += 0.5
+
+            reasons.append("ip_burst")
+
+        ua_l = ua.lower()
+
+        for sig in ["bot", "crawler", "spider", "headless", "phantom"]:
+
+            if sig in ua_l:
+
+                score += 0.6
+
+                reasons.append("ua_bot_" + sig)
+
+                break
+
+        if not ua.strip():
+
+            score += 0.3
+
+            reasons.append("empty_ua")
+
+        if len(ua) < 20:
+
+            score += 0.2
+
+            reasons.append("short_ua")
+
+        return {"fraud_score": round(min(1.0, score), 3),
+
+                "reasons": reasons, "is_fraud": score >= 0.6}
+
+
+
+
+
+class RateLimiter:
+
+    def __init__(self, window_sec=60, max_requests=10000):
+
+        self.window = window_sec
+
+        self.max = max_requests
+
+        self._buckets = {}
+
+        self._lock = threading.Lock()
+
+
+
+    def check(self, key):
+
+        now = int(time.time())
+
+        with self._lock:
+
+            b = self._buckets.setdefault(key, [])
+
+            b[:] = [t for t in b if now - t < self.window]
+
+            if len(b) >= self.max:
+
+                return False, len(b)
+
+            b.append(now)
+
+            return True, len(b)
+
+
+
+
+
+RATE_LIMITER = RateLimiter()
+
+
+
+
+
+class Attribution:
+
+    def last_click(self, clicks):
+
+        if not clicks:
+
+            return None
+
+        return sorted(clicks, key=lambda c: c.get("ts", ""), reverse=True)[0]
+
+
+
+    def linear(self, clicks, value_micros):
+
+        if not clicks:
+
+            return {}
+
+        share = int(value_micros / len(clicks))
+
+        return {c["id"]: share for c in clicks}
+
+
+
+    def time_decay(self, clicks, value_micros, half_life_hours=24.0):
+
+        if not clicks:
+
+            return {}
+
+        now = datetime.now()
+
+        weights = {}
+
+        for c in clicks:
+
+            try:
+
+                ts = datetime.fromisoformat(c["ts"])
+
+            except Exception:
+
+                ts = now
+
+            age = max(0.0, (now - ts).total_seconds() / 3600.0)
+
+            weights[c["id"]] = 0.5 ** (age / half_life_hours)
+
+        total = sum(weights.values()) or 1.0
+
+        return {k: int(value_micros * v / total) for k, v in weights.items()}
+
+
+
+
+
+class Reporting:
+
+    def summarize(self, entity_type, entity_id, start_date, end_date):
+
+        conn = db()
+
+        cur = conn.cursor()
+
+        cur.execute("""
+
+            SELECT SUM(impressions) AS impr, SUM(clicks) AS clicks,
+
+                   SUM(cost_micros) AS cost, SUM(conversions) AS conv,
+
+                   SUM(revenue_micros) AS rev
+
+            FROM metrics WHERE entity_type=? AND entity_id=? AND date>=? AND date<=?
+
+        """, (entity_type, entity_id, start_date, end_date))
+
+        row = cur.fetchone()
+
+        conn.close()
+
+        d = dict(row) if row else {}
+
+        impr = d.get("impr") or 0
+
+        clicks = d.get("clicks") or 0
+
+        cost = d.get("cost") or 0
+
+        conv = d.get("conv") or 0
+
+        rev = d.get("rev") or 0
+
+        return {"impressions": impr, "clicks": clicks, "cost_micros": cost,
+
+                "conversions": conv, "revenue_micros": rev,
+
+                "ctr": round((clicks / impr) if impr else 0.0, 6),
+
+                "cpc_micros": int((cost / clicks) if clicks else 0),
+
+                "cpa_micros": int((cost / conv) if conv else 0),
+
+                "roas": round((rev / cost) if cost else 0.0, 4)}
+
+
+
+    def timeline(self, entity_type, entity_id, days=30):
+
+        conn = db()
+
+        cur = conn.cursor()
+
+        start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+        cur.execute("""
+
+            SELECT date, SUM(impressions) AS impr, SUM(clicks) AS clicks,
+
+                   SUM(cost_micros) AS cost, SUM(conversions) AS conv,
+
+                   SUM(revenue_micros) AS rev
+
+            FROM metrics WHERE entity_type=? AND entity_id=? AND date>=?
+
+            GROUP BY date ORDER BY date ASC
+
+        """, (entity_type, entity_id, start))
+
+        rows = [dict(r) for r in cur.fetchall()]
+
+        conn.close()
+
+        return rows
+
+
+
+
+
+def promotion_figure_humain():
+
+    conn = db()
+
+    cur = conn.cursor()
+
+    cur.execute("SELECT id FROM campaigns WHERE name LIKE ? LIMIT 1",
+
+                ("%" + PROJET_NOM + "%",))
+
+    existing = cur.fetchone()
+
+    if existing:
+
+        conn.close()
+
+        log("INFO", "Campagne " + PROJET_NOM + " deja existante : " + existing["id"])
+
+        return existing["id"]
+
+
+
+    cur.execute("SELECT id FROM accounts LIMIT 1")
+
+    acc = cur.fetchone()
+
+    if not acc:
+
+        conn.close()
+
+        return None
+
+    account_id = acc["id"]
+
+
+
+    cmp_id = nid("cmp")
+
+    conn.execute("""INSERT INTO campaigns (id, account_id, name, status, budget_micros,
+
+                   budget_type, bid_strategy, network_search, network_display, created_at)
+
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+
+                 (cmp_id, account_id, PROJET_NOM + " - Campagne principale",
+
+                  "ACTIVE", 100000000, "DAILY", "MANUAL_CPC", 1, 1,
+
+                  datetime.now().isoformat()))
+
+
+
+    agr_id = nid("agr")
+
+    conn.execute("""INSERT INTO ad_groups (id, campaign_id, name, cpc_bid_micros,
+
+                   status, created_at) VALUES (?,?,?,?,?,?)""",
+
+                 (agr_id, cmp_id, "Figure Humain - Modelisation 3D", 3000000,
+
+                  "ACTIVE", datetime.now().isoformat()))
+
+
+
+    ads_data = [
+
+        {"headline1": "Figure-Humain - Modelisation 3D",
+
+         "headline2": "Python + Three.js", "headline3": "Open Source",
+
+         "description1": "Projet de modelisation d'une figure humaine.",
+
+         "description2": "Documente, versionne, forge par Aissa Mohammedi.",
+
+         "final_url": PROJET_URL},
+
+        {"headline1": "Figure Humaine - Rendu 3D",
+
+         "headline2": "Canvas + WebGL", "headline3": "Animation",
+
+         "description1": "Visualisation d'une figure humaine en 3D temps reel.",
+
+         "description2": "Code source disponible sur GitHub.",
+
+         "final_url": PROJET_URL},
+
+        {"headline1": "Modelisation Figure Humain",
+
+         "headline2": "Projet Python", "headline3": "Gratuit",
+
+         "description1": "Construction d'une figure humaine complete.",
+
+         "description2": "Decouvre le projet sur GitHub.",
+
+         "final_url": PROJET_URL},
+
+    ]
+
+    for ad in ads_data:
+
+        aid = nid("ad")
+
+        conn.execute("""INSERT INTO ads (id, ad_group_id, type, headline1, headline2,
+
+                       headline3, description1, description2, final_url, status, created_at)
+
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+
+                     (aid, agr_id, "RESPONSIVE_SEARCH", ad["headline1"],
+
+                      ad["headline2"], ad["headline3"], ad["description1"],
+
+                      ad["description2"], ad["final_url"], "ACTIVE",
+
+                      datetime.now().isoformat()))
+
+
+
+    keywords = [
+
+        ("figure humaine", "EXACT", 9),
+
+        ("modelisation figure humaine", "PHRASE", 8),
+
+        ("figure humaine 3d", "BROAD", 8),
+
+        ("projet figure humaine python", "BROAD", 7),
+
+        ("rendu 3d figure humaine", "BROAD", 7),
+
+        ("three.js figure humaine", "BROAD", 6),
+
+        ("github figure humaine", "BROAD", 6),
+
+    ]
+
+    for text, mt, qs in keywords:
+
+        kid = nid("kw")
+
+        conn.execute("""INSERT INTO keywords (id, ad_group_id, text, match_type,
+
+                       status, quality_score, cpc_bid_micros, created_at)
+
+                       VALUES (?,?,?,?,?,?,?,?)""",
+
+                     (kid, agr_id, text, mt, "ACTIVE", qs, 2500000,
+
+                      datetime.now().isoformat()))
+
+
+
+    for neg in ["free", "crack", "gratuit tout", "telecharger pirate"]:
+
+        neg_id = nid("neg")
+
+        conn.execute("""INSERT INTO negative_keywords (id, campaign_id, ad_group_id,
+
+                       text, match_type, created_at) VALUES (?,?,?,?,?,?)""",
+
+                     (neg_id, cmp_id, agr_id, neg, "PHRASE",
+
+                      datetime.now().isoformat()))
+
+
+
+    aud_id = nid("aud")
+
+    conn.execute("""INSERT INTO audiences (id, account_id, name, type, size, created_at)
+
+                   VALUES (?,?,?,?,?,?)""",
+
+                 (aud_id, account_id, "Developpeurs 3D / Python", "CUSTOM", 0,
+
+                  datetime.now().isoformat()))
+
+
+
+    for kind, value, mod in [("LOCATION", "FR", 1.3), ("LOCATION", "US", 1.1),
+
+                             ("DEVICE", "DESKTOP", 1.2), ("DEVICE", "MOBILE", 0.9)]:
+
+        tid = nid("tgt")
+
+        conn.execute("""INSERT INTO targeting (id, ad_group_id, kind, value,
+
+                       bid_modifier, created_at) VALUES (?,?,?,?,?,?)""",
+
+                     (tid, agr_id, kind, value, mod, datetime.now().isoformat()))
+
+
+
+    import random
+
+    for day in range(30):
+
+        d = (datetime.now() - timedelta(days=day)).strftime("%Y-%m-%d")
+
+        conn.execute("""INSERT OR REPLACE INTO metrics (entity_type, entity_id, date,
+
+                       hour, impressions, clicks, cost_micros, conversions, revenue_micros)
+
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+
+                     ("campaign", cmp_id, d, -1,
+
+                      random.randint(1000, 10000),
+
+                      random.randint(30, 400),
+
+                      random.randint(2000000, 30000000),
+
+                      random.randint(2, 50),
+
+                      random.randint(10000000, 100000000)))
+
+
+
+    conn.commit()
+
+    conn.close()
+
+    audit("promote_figure_humain", {"campaign": cmp_id})
+
+    log("OK", "Campagne " + PROJET_NOM + " creee : " + cmp_id)
+
+    return cmp_id
+
+
+
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+
+    protocol_version = "HTTP/1.1"
+
+
+
+    def log_message(self, *args):
+
+        pass
+
+
+
+    def _client_ip(self):
+
+        return self.client_address[0] if self.client_address else "?"
+
+
+
+    def _check_rate(self):
+
+        allowed, count = RATE_LIMITER.check(self._client_ip())
+
+        if not allowed:
+
+            self._json({"error": "rate_limited", "count": count}, 429)
+
+            return False
+
+        return True
+
+
+
+    def _check_auth(self, path):
+
+        ok, info = AUTH.check(self.headers, path)
+
+        if not ok:
+
+            self._json({"error": "unauthorized", "reason": info}, 401)
+
+            return False
+
+        return True
+
+
+
+    def _json(self, data, code=200):
+
+        body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+
+        self.send_response(code)
+
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+
+        self.send_header("Content-Length", str(len(body)))
+
+        self.send_header("Access-Control-Allow-Origin", "*")
+
+        self.send_header("X-Powered-By", "NexusAds/" + ENGINE_VERSION)
+
+        self.end_headers()
+
+        try:
+
+            self.wfile.write(body)
+
+        except Exception:
+
+            pass
+
+
+
+    def _html(self, content, code=200):
+
+        body = content.encode("utf-8")
+
+        self.send_response(code)
+
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+
+        self.send_header("Content-Length", str(len(body)))
+
+        self.end_headers()
+
+        try:
+
+            self.wfile.write(body)
+
+        except Exception:
+
+            pass
+
+
+
+    def _read_json(self):
+
+        try:
+
+            n = int(self.headers.get("Content-Length", 0))
+
+            if n == 0:
+
+                return {}
+
+            return json.loads(self.rfile.read(n).decode("utf-8"))
+
+        except Exception:
+
+            return {}
+
+
+
+    def do_GET(self):
+
+        if not self._check_rate():
+
+            return
+
+        p = urlparse(self.path)
+
+        path = p.path
+
+        qs = parse_qs(p.query)
+
+
+
+        if path == "/health":
+
+            self._json({"status": "ok", "time": datetime.now().isoformat(),
+
+                        "version": ENGINE_VERSION})
+
+            return
+
+        if path in ("/", "/index.html"):
+
+            self._html(HTML_PAGE)
+
+            return
+
+        if path == "/api/status":
+
+            self._status()
+
+            return
+
+
+
+        if not self._check_auth(path):
+
+            return
+
+
+
+        if path == "/api/query":
+
+            self._query_get(qs)
+
+        elif path == "/api/counts":
+
+            self._counts()
+
+        elif path == "/api/report":
+
+            self._report(qs)
+
+        elif path == "/api/timeline":
+
+            self._timeline(qs)
+
+        else:
+
+            self._json({"error": "not found", "path": path}, 404)
+
+
+
+    def _status(self):
+
+        now = time.time()
+
+        with STATUS_CACHE_LOCK:
+
+            if STATUS_CACHE["data"] and (now - STATUS_CACHE["ts"]) < STATUS_CACHE_TTL:
+
+                self._json(STATUS_CACHE["data"])
+
+                return
+
+
+
+        conn = db()
+
+        cur = conn.cursor()
+
+        counts = {}
+
+        for t in ALLOWED_TABLES.keys():
+
+            try:
+
+                cur.execute("SELECT COUNT(*) FROM " + t)
+
+                counts[t] = cur.fetchone()[0]
+
+            except Exception:
+
+                counts[t] = -1
+
+        conn.close()
+
+
+
+        data = {"engine": "NexusAds", "version": ENGINE_VERSION,
+
+                "counts": counts, "time": datetime.now().isoformat()}
+
+
+
+        with STATUS_CACHE_LOCK:
+
+            STATUS_CACHE["data"] = data
+
+            STATUS_CACHE["ts"] = now
+
+
+
+        self._json(data)
+
+
+
+    def _counts(self):
+
+        conn = db()
+
+        cur = conn.cursor()
+
+        out = {}
+
+        for t in ALLOWED_TABLES.keys():
+
+            try:
+
+                cur.execute("SELECT COUNT(*) FROM " + t)
+
+                out[t] = cur.fetchone()[0]
+
+            except Exception:
+
+                out[t] = -1
+
+        conn.close()
+
+        self._json(out)
+
+
+
+    def _query_get(self, qs):
+
+        q = qs.get("q", [""])[0]
+
+        if not q:
+
+            self._json({"error": "missing q"}, 400)
+
+            return
+
+        try:
+
+            rows = Query(q).execute()
+
+            self._json({"ok": True, "rows": rows, "count": len(rows)})
+
+        except Exception as e:
+
+            self._json({"ok": False, "error": str(e)}, 400)
+
+
+
+    def _report(self, qs):
+
+        et = qs.get("type", ["campaign"])[0]
+
+        eid = qs.get("id", [""])[0]
+
+        sd = qs.get("start", [(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")])[0]
+
+        ed = qs.get("end", [datetime.now().strftime("%Y-%m-%d")])[0]
+
+        self._json(Reporting().summarize(et, eid, sd, ed))
+
+
+
+    def _timeline(self, qs):
+
+        et = qs.get("type", ["campaign"])[0]
+
+        eid = qs.get("id", [""])[0]
+
+        days = int(qs.get("days", ["30"])[0])
+
+        r = Reporting().timeline(et, eid, days)
+
+        self._json({"rows": r, "count": len(r)})
+
+
+
+    def do_POST(self):
+
+        if not self._check_rate():
+
+            return
+
+        p = urlparse(self.path)
+
+        path = p.path
+
+
+
+        if path == "/api/login":
+
+            b = self._read_json()
+
+            email = b.get("email", "")
+
+            conn = db()
+
+            cur = conn.cursor()
+
+            cur.execute("SELECT id, api_key, role FROM users WHERE email=?", (email,))
+
+            row = cur.fetchone()
+
+            conn.close()
+
+            if row:
+
+                self._json({"ok": True, "user_id": row["id"],
+
+                            "api_key": row["api_key"], "role": row["role"]})
+
+            else:
+
+                self._json({"ok": False, "error": "user not found"}, 404)
+
+            return
+
+
+
+        if not self._check_auth(path):
+
+            return
+
+        body = self._read_json()
+
+
+
+        routes = {
+
+            "/api/accounts": self._create_account,
+
+            "/api/users": self._create_user,
+
+            "/api/campaigns": self._create_campaign,
+
+            "/api/ad_groups": self._create_ad_group,
+
+            "/api/ads": self._create_ad,
+
+            "/api/keywords": self._create_keyword,
+
+            "/api/negative_keywords": self._create_negative_keyword,
+
+            "/api/audiences": self._create_audience,
+
+            "/api/audience_members": self._add_audience_member,
+
+            "/api/targeting": self._create_targeting,
+
+            "/api/metrics": self._record_metric,
+
+            "/api/auction": self._run_auction,
+
+            "/api/query": self._query_post,
+
+            "/api/bid": self._compute_bid,
+
+            "/api/smart_bid": self._smart_bid,
+
+            "/api/click": self._record_click,
+
+            "/api/conversion": self._record_conversion,
+
+            "/api/attribute": self._attribute,
+
+            "/api/fraud_check": self._fraud_check,
+
+            "/api/promote_figure_humain": self._promote,
+
+        }
+
+
+
+        fn = routes.get(path)
+
+        if fn:
+
+            try:
+
+                fn(body)
+
+            except ValueError as e:
+
+                self._json({"error": "validation", "detail": str(e)}, 400)
+
+            except Exception as e:
+
+                log("ERR", path + " : " + str(e))
+
+                self._json({"error": str(e)}, 500)
+
+        else:
+
+            self._json({"error": "not found", "path": path}, 404)
+
+
+
+    def _create_account(self, b):
+
+        name = Validator.require_str(b, "name", 1, 200)
+
+        aid = nid("acc")
+
+        conn = db()
+
+        conn.execute("""INSERT INTO accounts (id, name, currency, timezone, created_at)
+
+                       VALUES (?,?,?,?,?)""",
+
+                     (aid, name, b.get("currency", "USD"),
+
+                      b.get("timezone", "UTC"), datetime.now().isoformat()))
+
+        conn.commit()
+
+        conn.close()
+
+        audit("create_account", {"id": aid, "name": name})
+
+        self._json({"id": aid, "status": "created"})
+
+
+
+    def _create_user(self, b):
+
+        account_id = Validator.require_str(b, "account_id")
+
+        email = Validator.require_str(b, "email", 3, 200)
+
+        role = Validator.optional_str(b, "role", "VIEWER")
+
+        uid = nid("usr")
+
+        api_key = hashlib.sha256((uid + str(time.time())).encode()).hexdigest()[:32]
+
+        conn = db()
+
+        conn.execute("""INSERT INTO users (id, account_id, email, role, api_key,
+
+                       created_at) VALUES (?,?,?,?,?,?)""",
+
+                     (uid, account_id, email, role, api_key,
+
+                      datetime.now().isoformat()))
+
+        conn.commit()
+
+        conn.close()
+
+        audit("create_user", {"id": uid, "email": email})
+
+        self._json({"id": uid, "api_key": api_key})
+
+
+
+    def _create_campaign(self, b):
+
+        account_id = Validator.require_str(b, "account_id")
+
+        name = Validator.require_str(b, "name")
+
+        cid = nid("cmp")
+
+        conn = db()
+
+        conn.execute("""INSERT INTO campaigns (id, account_id, name, status,
+
+                       budget_micros, budget_type, bid_strategy, network_search,
+
+                       network_display, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+
+                     (cid, account_id, name, b.get("status", "PAUSED"),
+
+                      Validator.require_int(b, "budget_micros", 0, 10**12),
+
+                      b.get("budget_type", "DAILY"),
+
+                      b.get("bid_strategy", "MANUAL_CPC"),
+
+                      int(b.get("network_search", 1)),
+
+                      int(b.get("network_display", 0)),
+
+                      datetime.now().isoformat()))
+
+        conn.commit()
+
+        conn.close()
+
+        self._json({"id": cid, "status": "created"})
+
+
+
+    def _create_ad_group(self, b):
+
+        campaign_id = Validator.require_str(b, "campaign_id")
+
+        name = Validator.require_str(b, "name")
+
+        gid = nid("agr")
+
+        conn = db()
+
+        conn.execute("""INSERT INTO ad_groups (id, campaign_id, name, cpc_bid_micros,
+
+                       status, created_at) VALUES (?,?,?,?,?,?)""",
+
+                     (gid, campaign_id, name,
+
+                      Validator.require_int(b, "cpc_bid_micros", 0),
+
+                      b.get("status", "PAUSED"), datetime.now().isoformat()))
+
+        conn.commit()
+
+        conn.close()
+
+        self._json({"id": gid, "status": "created"})
+
+
+
+    def _create_ad(self, b):
+
+        ad_group_id = Validator.require_str(b, "ad_group_id")
+
+        headline1 = Validator.require_str(b, "headline1", 1, 90)
+
+        final_url = Validator.require_str(b, "final_url", 5, 500)
+
+        aid = nid("ad")
+
+        conn = db()
+
+        conn.execute("""INSERT INTO ads (id, ad_group_id, type, headline1, headline2,
+
+                       headline3, description1, description2, final_url, display_url,
+
+                       status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+
+                     (aid, ad_group_id, b.get("type", "RESPONSIVE_SEARCH"),
+
+                      headline1, b.get("headline2", ""), b.get("headline3", ""),
+
+                      b.get("description1", ""), b.get("description2", ""),
+
+                      final_url, b.get("display_url", ""),
+
+                      b.get("status", "PAUSED"), datetime.now().isoformat()))
+
+        conn.commit()
+
+        conn.close()
+
+        self._json({"id": aid, "status": "created"})
+
+
+
+    def _create_keyword(self, b):
+
+        ad_group_id = Validator.require_str(b, "ad_group_id")
+
+        text = Validator.require_str(b, "text", 1, 200)
+
+        kid = nid("kw")
+
+        conn = db()
+
+        conn.execute("""INSERT INTO keywords (id, ad_group_id, text, match_type,
+
+                       status, quality_score, cpc_bid_micros, created_at)
+
+                       VALUES (?,?,?,?,?,?,?,?)""",
+
+                     (kid, ad_group_id, text, b.get("match_type", "BROAD"),
+
+                      b.get("status", "ACTIVE"),
+
+                      Validator.require_int(b, "quality_score", 0, 10),
+
+                      Validator.require_int(b, "cpc_bid_micros", 0),
+
+                      datetime.now().isoformat()))
+
+        conn.commit()
+
+        conn.close()
+
+        self._json({"id": kid, "status": "created"})
+
+
+
+    def _create_negative_keyword(self, b):
+
+        text = Validator.require_str(b, "text")
+
+        neg_id = nid("neg")
+
+        conn = db()
+
+        conn.execute("""INSERT INTO negative_keywords (id, campaign_id, ad_group_id,
+
+                       text, match_type, created_at) VALUES (?,?,?,?,?,?)""",
+
+                     (neg_id, b.get("campaign_id"), b.get("ad_group_id"), text,
+
+                      b.get("match_type", "BROAD"), datetime.now().isoformat()))
+
+        conn.commit()
+
+        conn.close()
+
+        self._json({"id": neg_id, "status": "created"})
+
+
+
+    def _create_audience(self, b):
+
+        account_id = Validator.require_str(b, "account_id")
+
+        name = Validator.require_str(b, "name")
+
+        aud = nid("aud")
+
+        conn = db()
+
+        conn.execute("""INSERT INTO audiences (id, account_id, name, type, size,
+
+                       created_at) VALUES (?,?,?,?,?,?)""",
+
+                     (aud, account_id, name, b.get("type", "CUSTOM"), 0,
+
+                      datetime.now().isoformat()))
+
+        conn.commit()
+
+        conn.close()
+
+        self._json({"id": aud, "status": "created"})
+
+
+
+    def _add_audience_member(self, b):
+
+        aid = Validator.require_str(b, "audience_id")
+
+        raw = Validator.require_str(b, "user_id")
+
+        h = hashlib.sha256(raw.encode()).hexdigest()
+
+        conn = db()
+
+        try:
+
+            conn.execute("""INSERT OR IGNORE INTO audience_members
+
+                           (audience_id, user_hash, added_at) VALUES (?,?,?)""",
+
+                         (aid, h, datetime.now().isoformat()))
+
+            conn.execute("UPDATE audiences SET size = size + 1 WHERE id=?", (aid,))
+
+            conn.commit()
+
+        except Exception:
+
+            pass
+
+        conn.close()
+
+        self._json({"status": "added", "hash": h})
+
+
+
+    def _create_targeting(self, b):
+
+        ad_group_id = Validator.require_str(b, "ad_group_id")
+
+        kind = Validator.require_str(b, "kind")
+
+        value = Validator.require_str(b, "value")
+
+        tid = nid("tgt")
+
+        conn = db()
+
+        conn.execute("""INSERT INTO targeting (id, ad_group_id, kind, value,
+
+                       bid_modifier, created_at) VALUES (?,?,?,?,?,?)""",
+
+                     (tid, ad_group_id, kind, value,
+
+                      Validator.optional_float(b, "bid_modifier", 1.0),
+
+                      datetime.now().isoformat()))
+
+        conn.commit()
+
+        conn.close()
+
+        self._json({"id": tid, "status": "created"})
+
+
+
+    def _record_metric(self, b):
+
+        entity_type = Validator.require_str(b, "entity_type")
+
+        entity_id = Validator.require_str(b, "entity_id")
+
+        conn = db()
+
+        conn.execute("""INSERT OR REPLACE INTO metrics (entity_type, entity_id, date,
+
+                       hour, impressions, clicks, cost_micros, conversions,
+
+                       revenue_micros) VALUES (?,?,?,?,?,?,?,?,?)""",
+
+                     (entity_type, entity_id,
+
+                      b.get("date", datetime.now().strftime("%Y-%m-%d")),
+
+                      Validator.require_int(b, "hour", -1, 23),
+
+                      Validator.require_int(b, "impressions", 0),
+
+                      Validator.require_int(b, "clicks", 0),
+
+                      Validator.require_int(b, "cost_micros", 0),
+
+                      Validator.require_int(b, "conversions", 0),
+
+                      Validator.require_int(b, "revenue_micros", 0)))
+
+        conn.commit()
+
+        conn.close()
+
+        self._json({"status": "recorded"})
+
+
+
+    def _run_auction(self, b):
+
+        candidates = b.get("candidates", [])
+
+        if not candidates:
+
+            self._json({"error": "no candidates"}, 400)
+
+            return
+
+        auc_id = nid("auc")
+
+        ranking = Auction().run(candidates)
+
+        winner = ranking[0] if ranking else {}
+
+        conn = db()
+
+        conn.execute("""INSERT INTO auctions (id, query, request_json, response_json,
+
+                       winner_ad_id, winner_bid_micros, created_at)
+
+                       VALUES (?,?,?,?,?,?,?)""",
+
+                     (auc_id, b.get("query", ""),
+
+                      json.dumps(candidates, ensure_ascii=False),
+
+                      json.dumps(ranking, ensure_ascii=False),
+
+                      winner.get("ad_id", ""), winner.get("paid_micros", 0),
+
+                      datetime.now().isoformat()))
+
+        conn.commit()
+
+        conn.close()
+
+        self._json({"ok": True, "auction_id": auc_id, "ranking": ranking})
+
+
+
+    def _query_post(self, b):
+
+        q = b.get("query", "")
+
+        if not q:
+
+            self._json({"error": "missing query"}, 400)
+
+            return
+
+        try:
+
+            rows = Query(q).execute()
+
+            self._json({"ok": True, "rows": rows, "count": len(rows)})
+
+        except Exception as e:
+
+            self._json({"ok": False, "error": str(e)}, 400)
+
+
+
+    def _compute_bid(self, b):
+
+        base = Validator.require_int(b, "base_bid_micros", 1, 10**12)
+
+        signals = b.get("signals", {})
+
+        e = BiddingEngine()
+
+        final = e.compute_bid(base, signals)
+
+        self._json({"ok": True, "base": base, "final": final,
+
+                    "explain": e.explain(base, signals)})
+
+
+
+    def _smart_bid(self, b):
+
+        camp = b.get("campaign", {})
+
+        hc = Validator.require_int(b, "historical_cpa_micros", 0)
+
+        tc = Validator.require_int(b, "target_cpa_micros", 0)
+
+        new_budget = BiddingEngine().smart_bid(camp, hc, tc)
+
+        self._json({"ok": True, "new_budget_micros": new_budget})
+
+
+
+    def _record_click(self, b):
+
+        cid = nid("clk")
+
+        fraud = FraudDetector().check(b)
+
+        if fraud["is_fraud"]:
+
+            self._json({"status": "fraud_rejected", "fraud": fraud})
+
+            return
+
+        conn = db()
+
+        conn.execute("""INSERT INTO clicks (id, ad_id, keyword_id, ip_hash,
+
+                       user_agent, gclid, ts) VALUES (?,?,?,?,?,?,?)""",
+
+                     (cid, b.get("ad_id", ""), b.get("keyword_id", ""),
+
+                      b.get("ip_hash", ""), b.get("user_agent", "")[:200],
+
+                      b.get("gclid", ""), datetime.now().isoformat()))
+
+        conn.commit()
+
+        conn.close()
+
+        self._json({"status": "click_recorded", "click_id": cid, "fraud": fraud})
+
+
+
+    def _record_conversion(self, b):
+
+        cid = nid("cnv")
+
+        conn = db()
+
+        conn.execute("""INSERT INTO conversions (id, click_id, ad_id, value_micros, ts)
+
+                       VALUES (?,?,?,?,?)""",
+
+                     (cid, b.get("click_id", ""), b.get("ad_id", ""),
+
+                      Validator.require_int(b, "value_micros", 0),
+
+                      datetime.now().isoformat()))
+
+        conn.commit()
+
+        conn.close()
+
+        self._json({"status": "conversion_recorded", "conversion_id": cid})
+
+
+
+    def _attribute(self, b):
+
+        clicks = b.get("clicks", [])
+
+        value = Validator.require_int(b, "value_micros", 0)
+
+        model = b.get("model", "last_click")
+
+        a = Attribution()
+
+        if model == "last_click":
+
+            r = a.last_click(clicks)
+
+        elif model == "linear":
+
+            r = a.linear(clicks, value)
+
+        elif model == "time_decay":
+
+            r = a.time_decay(clicks, value,
+
+                             Validator.optional_float(b, "half_life_hours", 24.0))
+
+        else:
+
+            r = {"error": "unknown model"}
+
+        self._json({"model": model, "attribution": r})
+
+
+
+    def _fraud_check(self, b):
+
+        self._json(FraudDetector().check(b))
+
+
+
+    def _promote(self, b):
+
+        cmp_id = promotion_figure_humain()
+
+        if cmp_id:
+
+            conn = db()
+
+            cur = conn.cursor()
+
+            cur.execute("""SELECT COUNT(*) FROM ads WHERE ad_group_id IN
+
+                           (SELECT id FROM ad_groups WHERE campaign_id=?)""", (cmp_id,))
+
+            nb_ads = cur.fetchone()[0]
+
+            cur.execute("""SELECT COUNT(*) FROM keywords WHERE ad_group_id IN
+
+                           (SELECT id FROM ad_groups WHERE campaign_id=?)""", (cmp_id,))
+
+            nb_kw = cur.fetchone()[0]
+
+            conn.close()
+
+            self._json({"ok": True, "projet": PROJET_NOM, "url": PROJET_URL,
+
+                        "campaign_id": cmp_id, "nb_ads": nb_ads, "nb_keywords": nb_kw})
+
+        else:
+
+            self._json({"error": "no account, create one first"}, 400)
+
+
+
+
+
+HTML_PAGE = """<!DOCTYPE html>
+
+<html lang="fr"><head><meta charset="UTF-8">
+
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<title>Nexus Ads Engine v3.4</title>
+
+<style>
+
+*{margin:0;padding:0;box-sizing:border-box}
+
+body{font-family:-apple-system,system-ui,sans-serif;background:#0a0014;color:#fff;padding:20px}
+
+.c{max-width:1200px;margin:0 auto}
+
+h1{color:#c8a45c;font-size:28px;margin-bottom:6px}
+
+.s{color:#888;margin-bottom:20px;font-size:13px}
+
+.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:20px}
+
+.st{background:#14001f;border:1px solid #2a1a3a;border-radius:10px;padding:14px;text-align:center}
+
+.st .n{font-size:22px;font-weight:700;color:#c8a45c;display:block}
+
+.st .l{font-size:9px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-top:4px;display:block}
+
+.b{background:#14001f;border:1px solid #2a1a3a;border-radius:10px;padding:18px;margin-bottom:14px}
+
+.b h2{color:#c8a45c;font-size:14px;margin-bottom:10px}
+
+textarea{width:100%;background:#0a0014;border:1px solid #2a1a3a;color:#4ade80;padding:10px;border-radius:6px;font-family:monospace;font-size:11px;min-height:60px}
+
+button{background:#c8a45c;color:#000;border:none;padding:8px 16px;border-radius:999px;font-weight:600;cursor:pointer;margin-top:8px;font-size:12px}
+
+button.promo{background:linear-gradient(135deg,#c8a45c,#ff6ec7);color:#fff;font-size:14px;padding:12px 24px}
+
+pre{background:#0a0014;padding:12px;border-radius:6px;overflow-x:auto;font-size:11px;color:#4ade80;margin-top:10px;max-height:300px}
+
+.hl{background:#14001f;border:2px solid #c8a45c;border-radius:10px;padding:20px;margin-bottom:20px;text-align:center}
+
+</style></head><body><div class="c">
+
+<h1>Nexus Ads Engine v3.4</h1>
+
+<p class="s">Auth API. Cache. Auto-promo figure-humain.</p>
+
+
+
+<div class="hl">
+
+<h2 style="color:#c8a45c;font-size:16px;margin-bottom:12px">PROJET A PROMOUVOIR</h2>
+
+<p style="font-size:14px;margin-bottom:8px"><strong>Figure-Humain</strong></p>
+
+<p style="font-size:12px;color:#888;margin-bottom:14px">github.com/Aissamohammedi88/figure-humain</p>
+
+<button class="promo" onclick="promouvoir()">Lancer la campagne auto</button>
+
+<pre id="promoOut" style="display:none;text-align:left"></pre>
+
+</div>
+
+
+
+<div class="g" id="stats"></div>
+
+
+
+<div class="b"><h2>Login</h2>
+
+<textarea id="logq">{"email":"aissa@nexus.dev"}</textarea>
+
+<button onclick="login()">Login</button>
+
+<pre id="logOut"></pre></div>
+
+
+
+<div class="b"><h2>Query Language</h2>
+
+<textarea id="q">SELECT id, name, status FROM campaigns LIMIT 20</textarea>
+
+<button onclick="runQ()">Execute</button>
+
+<pre id="qOut"></pre></div>
+
+
+
+<div class="b"><h2>Bidding</h2>
+
+<textarea id="bq">{"base_bid_micros":1000000,"signals":{"quality_score":8,"ctr":0.04,"match_type":"EXACT","device":"DESKTOP","in_audience":true}}</textarea>
+
+<button onclick="runB()">Compute</button>
+
+<pre id="bOut"></pre></div>
+
+
+
+<div class="b"><h2>Auction</h2>
+
+<textarea id="aq">{"candidates":[{"ad_id":"a1","bid_micros":1000000,"quality_score":8,"expected_ctr":0.03},{"ad_id":"a2","bid_micros":800000,"quality_score":9,"expected_ctr":0.05}]}</textarea>
+
+<button onclick="runA()">Run</button>
+
+<pre id="aOut"></pre></div>
+
+
+
+</div>
+
+<script>
+
+let TOKEN = '';
+
+async function loadStats(){
+
+  try{
+
+    const r = await fetch('/api/status');
+
+    const d = await r.json();
+
+    const g = document.getElementById('stats');
+
+    g.innerHTML='';
+
+    Object.keys(d.counts).forEach(k=>{
+
+      g.innerHTML += '<div class="st"><span class="n">'+d.counts[k]+'</span><span class="l">'+k+'</span></div>';
+
+    });
+
+  }catch(e){}
+
+}
+
+async function call(url, data, out, useToken){
+
+  if(useToken === undefined) useToken = true;
+
+  try{
+
+    const opts = {method:'POST', headers:{'Content-Type':'application/json'}};
+
+    if(useToken && TOKEN) opts.headers['Authorization'] = 'Bearer ' + TOKEN;
+
+    if(data) opts.body = JSON.stringify(data);
+
+    const r = await fetch(url, opts);
+
+    const d = await r.json();
+
+    document.getElementById(out).textContent = JSON.stringify(d, null, 2);
+
+    return d;
+
+  }catch(e){
+
+    document.getElementById(out).textContent = 'ERROR ' + e;
+
+    return null;
+
+  }
+
+}
+
+async function login(){
+
+  try{
+
+    const d = JSON.parse(document.getElementById('logq').value);
+
+    const r = await call('/api/login', d, 'logOut', false);
+
+    if(r && r.api_key){ TOKEN = r.api_key; alert('Token : ' + TOKEN); }
+
+  }catch(e){ document.getElementById('logOut').textContent = 'JSON invalide'; }
+
+}
+
+function runQ(){ call('/api/query',{query:document.getElementById('q').value},'qOut'); }
+
+function runB(){ try{ call('/api/bid', JSON.parse(document.getElementById('bq').value),'bOut'); }catch(e){ document.getElementById('bOut').textContent='JSON invalide'; } }
+
+function runA(){ try{ call('/api/auction', JSON.parse(document.getElementById('aq').value),'aOut'); }catch(e){ document.getElementById('aOut').textContent='JSON invalide'; } }
+
+async function promouvoir(){
+
+  const out = document.getElementById('promoOut');
+
+  out.style.display = 'block';
+
+  out.textContent = 'Creation de la campagne...';
+
+  await call('/api/promote_figure_humain', {}, 'promoOut');
+
+  loadStats();
+
+}
+
+loadStats();
+
+</script></body></html>"""
+
+
+
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+
+    daemon_threads = True
+
+    allow_reuse_address = True
+
+    request_queue_size = 256
+
+
+
+
+
+def seed():
+
+    time.sleep(1)
+
+    conn = db()
+
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM accounts")
+
+    deja_fait = cur.fetchone()[0] > 0
+
+
+
+    if deja_fait:
+
+        cur.execute("SELECT api_key FROM users WHERE role='ADMIN' LIMIT 1")
+
+        row = cur.fetchone()
+
+        conn.close()
+
+        log("INFO", "Seed : deja fait")
+
+        if row:
+
+            print("")
+
+            print(M + "=" * 64 + N)
+
+            print(M + "  TOKEN ADMIN : " + row["api_key"] + N)
+
+            print(M + "  UI : http://localhost:" + str(PORT) + "/" + N)
+
+            print(M + "=" * 64 + N)
+
+            print("")
+
+        return
+
+
+
+    conn.close()
+
+    log("INFO", "Seed demo...")
+
+
+
+    acc_id = nid("acc")
+
+    conn = db()
+
+    conn.execute("""INSERT INTO accounts (id, name, currency, timezone, created_at)
+
+                   VALUES (?,?,?,?,?)""",
+
+                 (acc_id, "Nexus Demo", "USD", "UTC", datetime.now().isoformat()))
+
+    conn.commit()
+
+    conn.close()
+
+
+
+    uid = nid("usr")
+
+    api_key = hashlib.sha256((uid + str(time.time())).encode()).hexdigest()[:32]
+
+    conn = db()
+
+    conn.execute("""INSERT INTO users (id, account_id, email, role, api_key, created_at)
+
+                   VALUES (?,?,?,?,?,?)""",
+
+                 (uid, acc_id, "aissa@nexus.dev", "ADMIN", api_key,
+
+                  datetime.now().isoformat()))
+
+    conn.commit()
+
+    conn.close()
+
+    log("OK", "Seed : user " + uid)
+
+
+
+    cmp_id = promotion_figure_humain()
+
+    if cmp_id:
+
+        log("OK", "Seed : campagne " + cmp_id)
+
+    else:
+
+        log("WARN", "Seed : promotion echouee")
+
+
+
+    print("")
+
+    print(M + "=" * 64 + N)
+
+    print(M + "  TOKEN ADMIN : " + api_key + N)
+
+    print(M + "  UI : http://localhost:" + str(PORT) + "/" + N)
+
+    print(M + "=" * 64 + N)
+
+    print("")
+
+
+
+
+
+def main():
+
+    print("")
+
+    print(C + "=" * 70 + N)
+
+    print(C + "  NEXUS ADS ENGINE v" + ENGINE_VERSION + N)
+
+    print(C + "  Cache + WAL + Auto-promo figure-humain." + N)
+
+    print(C + "=" * 70 + N)
+
+
+
+    if not check_lock():
+
+        log("ERR", "Instance deja active. Arret.")
+
+        sys.exit(1)
+
+
+
+    init_db()
+
+    backup_db()
+
+
+
+    try:
+
+        seed()
+
+    except Exception as e:
+
+        log("WARN", "Seed initial : " + str(e))
+
+
+
+    log("INFO", "Starting HTTP server on port " + str(PORT))
+
+    try:
+
+        with Server((HOST, PORT), Handler) as httpd:
+
+            log("OK", "Listening: http://127.0.0.1:" + str(PORT) + "/")
+
+            log("INFO", "Public: / /health /api/status /api/login")
+
+            log("INFO", "Auth:   Bearer <api_key> sur les autres routes")
+
+            log("INFO", "Promo:  POST /api/promote_figure_humain")
+
+            print("")
+
+            httpd.serve_forever()
+
+    except KeyboardInterrupt:
+
+        log("INFO", "Stopped.")
+
+    except OSError as e:
+
+        log("ERR", "Port " + str(PORT) + " : " + str(e))
+
+    finally:
+
+        try:
+
+            if LOCK_FILE.exists():
+
+                LOCK_FILE.unlink()
+
+        except Exception:
+
+            pass
+
+
+
+
+
+if __name__ == "__main__":
+
+    main()
